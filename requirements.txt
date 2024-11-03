@@ -1,0 +1,9 @@
+torch==2.0.1
+matplotlib
+xgboost
+scikit-learn
+pandas
+numpy
+tqdm
+transformers
+sentence_transformers
