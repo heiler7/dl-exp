@@ -186,21 +186,91 @@ class LSTM(nn.Module):
 
 
 class TransformerTimeSeries(nn.Module):
-    def __init__(self, input_dim, output_dim, seq_length, pred_length, d_model=64, nhead=4, num_layers=2):
-        super(TransformerTimeSeries, self).__init__()
-        self.d_model = d_model
-        self.embedding = nn.Linear(input_dim, d_model)
-        self.positional_encoding = nn.Parameter(torch.zeros(seq_length, d_model))
-        self.transformer = nn.Transformer(d_model=d_model, nhead=nhead, num_encoder_layers=num_layers, num_decoder_layers=num_layers,batch_first=True)
-        self.fc_out = nn.Linear(d_model, output_dim)
+    def __init__(
+        self,
+        n_encoder_inputs,
+        n_decoder_inputs,
+        channels=512,
+        dropout=0.1,
+    ):
+        super().__init__()
+        self.dropout = dropout
+        self.input_pos_embedding = torch.nn.Embedding(1024, embedding_dim=channels)
+        self.target_pos_embedding = torch.nn.Embedding(1024, embedding_dim=channels)
 
-    def forward(self, x, tgt):
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=channels,
+            nhead=8,
+            dropout=self.dropout,
+            dim_feedforward=4 * channels,
+        )
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=channels,
+            nhead=8,
+            dropout=self.dropout,
+            dim_feedforward=4 * channels,
+        )
+
+        self.encoder = torch.nn.TransformerEncoder(encoder_layer, num_layers=8)
+        self.decoder = torch.nn.TransformerDecoder(decoder_layer, num_layers=8)
+
+        self.input_projection = nn.Linear(n_encoder_inputs, channels)
+        self.output_projection = nn.Linear(n_decoder_inputs, channels)
+
+        self.fc = nn.Linear(channels, 2)
+        self.do = nn.Dropout(p=self.dropout)
+
+    def encode_src(self, src):
+        src_start = self.input_projection(src).permute(1, 0, 2)
+        in_sequence_len, batch_size = src_start.size(0), src_start.size(1)
+        pos_encoder = (
+            torch.arange(0, in_sequence_len, device=src.device)
+            .unsqueeze(0)
+            .repeat(batch_size, 1)
+        )
+        pos_encoder = self.input_pos_embedding(pos_encoder).permute(1, 0, 2)
+        src = src_start + pos_encoder
+        src = self.encoder(src) + src_start
+        return src
+    
+    def gen_trg_mask(self,length, device):
+        mask = torch.tril(torch.ones(length, length, device=device)) == 1
+
+        mask = (
+            mask.float()
+            .masked_fill(mask == 0, float("-inf"))
+            .masked_fill(mask == 1, float(0.0))
+        )
+        return mask
+    
+    def decode_trg(self, trg, memory):
+
+        trg_start = self.output_projection(trg).permute(1, 0, 2)
+        out_sequence_len, batch_size = trg_start.size(0), trg_start.size(1)
+
+        pos_decoder = (
+            torch.arange(0, out_sequence_len, device=trg.device)
+            .unsqueeze(0)
+            .repeat(batch_size, 1)
+        )
+        pos_decoder = self.target_pos_embedding(pos_decoder).permute(1, 0, 2)
+
+        trg = pos_decoder + trg_start
+        trg_mask = self.gen_trg_mask(out_sequence_len, trg.device)
+
+        out = self.decoder(tgt=trg, memory=memory, tgt_mask=trg_mask) + trg_start
+        out = out.permute(1, 0, 2)
+        out = self.fc(out)
+
+        return out
+    
+    def forward(self, x,target):
         apply = torch.narrow(x, dim=-1, start=2, length=1)[:, :, ].squeeze(1)
         redeem = torch.narrow(x, dim=-1, start=3, length=1)[:, :, ].squeeze(1)
-        x = self.embedding(x) + self.positional_encoding
-        tgt = self.embedding(tgt) + self.positional_encoding[:tgt.size(1), :]
-        output = self.transformer(x, tgt)
-        output = self.fc_out(output)
+        # target = torch.narrow(x, dim=-1, start=2, length=2)[:, :, ].squeeze(1)
+        src = x
+        src = self.encode_src(src)
+        output = self.decode_trg(trg=target, memory=src)
         return output
 
 def predict(path,predict_input,model):
@@ -216,9 +286,41 @@ def predict(path,predict_input,model):
             data = data[-20:,:]
             data = torch.tensor(data, dtype=torch.float32)
             data = data.reshape(1,data.shape[0],data.shape[1])
+            # output = model(data.to(device))
             output = model(data.to(device))
             output = output.squeeze(0)
             results[i] = np.array(output.cpu())
+
+    return results
+    
+def predict_trans(path,predict_input,model):
+    results = {}
+    df = pd.read_csv(path)
+    print(df.columns)
+    products = df['product_pid'].unique()
+    model.eval()
+    with torch.no_grad():
+        for i in products:
+            data = predict_input[i]
+            data = np.array(data).astype(np.float32)
+            data = torch.tensor(data, dtype=torch.float32)
+            data = data.reshape(1,data.shape[0],data.shape[1])
+            target1 = torch.narrow(data, dim=-1, start=2, length=2)[0,-1,:]
+            target1 = target1.reshape(1,1,-1).to(device)
+            # output = model(data.to(device))
+            for j in range(10):
+                output = model(data.to(device),target1)
+                output = output[:,-1:,:]
+                target1 = torch.cat([target1,output],dim=1)
+            
+            # test
+            target1 = target1[:,1:,:]
+            output1 = model(data.to(device),target1).squeeze(0)
+            results[i] = np.array(output1.cpu())
+            
+            # before
+            # target1 = target1[:,1:,:].squeeze(0)
+            # results[i] = np.array(target1.cpu())
 
     return results
 
@@ -234,14 +336,13 @@ groups = df.groupby('product_pid')
 samples = []
 
 predict_input = {}
+predict_trans_input = {}
 for _, group in groups:
     product_samples = group.values
     num_samples = len(product_samples)
     # scaler = MinMaxScaler(feature_range=(-1, 1))
     product_name = product_samples[0][0]
-    if num_samples < 30:
-        continue
-    
+        
     templst = []
     
     for j in range(num_samples):
@@ -249,11 +350,15 @@ for _, group in groups:
         product_samples[j,7] = timechange(product_samples[j,7])
         product_samples[j,8] = timechange(product_samples[j,8])
         product_samples[j,0] = product_samples[j,0].replace('product','')
-        # column_redeem_temp = product_samples[j,3]
-        # column_apply_temp = product_samples[j,2]
-        # if np.count_nonzero(column_redeem_temp) == column_redeem_temp.size and np.count_nonzero(column_apply_temp) == column_apply_temp.size:
-        #     templst.append(product_samples[j])
+        column_redeem_temp = product_samples[j,3]
+        column_apply_temp = product_samples[j,2]
+        if np.count_nonzero(column_redeem_temp) == 1 or np.count_nonzero(column_apply_temp) == 1:
+            templst.append(product_samples[j])
     
+    if num_samples < 30:
+        continue
+    
+    predict_trans_input[product_name] = templst
     
     
     for i in range(num_samples - 29):
@@ -262,7 +367,7 @@ for _, group in groups:
         column_apply_temp = sample[-10:, 2]
         
         are_elements_same = not (np.all(column_apply_temp != column_apply_temp[0]) or np.all(column_redeem_temp != column_redeem_temp[0]))
-        if are_elements_same and np.count_nonzero(column_redeem_temp) == column_redeem_temp.size and np.count_nonzero(column_apply_temp) == column_apply_temp.size:
+        if are_elements_same and np.count_nonzero(column_redeem_temp) == column_redeem_temp.size or np.count_nonzero(column_apply_temp) == column_apply_temp.size:
             samples.append(sample)
     
     predict_input[product_name] = samples[-1]
@@ -293,10 +398,11 @@ labels = torch.tensor(train_label, dtype=torch.float32)
 batch_size = 500
 learning_rate = 0.001
 N = data.shape[0]
-num_epochs = 60
+num_epochs = 49
 k = 5
 input_dim = 14
 output_dim = 2
+target_input_dim = 2
 seq_length = 20
 pred_length = 10
 
@@ -320,8 +426,10 @@ for i, (train_idx, test_idx) in enumerate(splits):
     dataset_val = TensorDataset(data_val, label_val)
     train_loader = DataLoader(dataset_train, shuffle=False, batch_size=batch_size)
     val_loader = DataLoader(dataset_val, shuffle=False, batch_size=batch_size)
-    modeltrans = TransformerTimeSeries(input_dim, output_dim, seq_length, pred_length)
-    model = LSTM(input_dim=1, hidden_dim=2, output_dim=20)
+    
+    model = TransformerTimeSeries(input_dim, target_input_dim)
+    
+    # model = LSTM(input_dim=1, hidden_dim=2, output_dim=20)
     model.to(device)
     criterion = nn.MSELoss()
 
@@ -342,9 +450,13 @@ for i, (train_idx, test_idx) in enumerate(splits):
         for data_t, y in tqdm(train_loader):
             optimizer.zero_grad()
             counter += 1
-            output = model(data_t.to(device))
+            # output = model(data_t.to(device))
+            
             # Transformers:
-            # output = modeltrans(data_t,y)
+            target = torch.cat([data_t[:,-1:,2:4],y],dim=1).to(device)
+            output = model(data_t.to(device),target)
+            output = output[:,:-1,:]
+            
             loss = criterion(output, y.to(device))
             train_running_loss += loss.item()
             loss.backward()
@@ -362,7 +474,13 @@ for i, (train_idx, test_idx) in enumerate(splits):
 
             for data_v, y in tqdm(val_loader):
                 counter += 1
-                output = model(data_v.to(device))
+                # output = model(data_v.to(device),y.to(device))
+                
+                # Transformers:
+                target = torch.cat([data_v[:,-1:,2:4],y],dim=1).to(device)
+                output = model(data_v.to(device),target)
+                output = output[:,:-1,:]
+                
                 loss = criterion(output, y.to(device))
                 current_test_loss += loss.item()
                 predict_res.extend(output.cpu().numpy())
@@ -385,7 +503,11 @@ for i, (train_idx, test_idx) in enumerate(splits):
         
     Lk.append(L_train)
     Lk_v.append(L_val)
-    results1 = predict(predict_path,predict_input,model)
+    
+    # results1 = predict(predict_path,predict_input,model)
+    # transformer:
+    # results1 = predict_trans(predict_path,predict_input,model)
+    results1 = predict_trans(predict_path,predict_trans_input,model)
     results_all.append(results1)
 
 fig1, ax1 = plt.subplots()
@@ -424,61 +546,3 @@ for key in results_all[0].keys():
 df_pre.to_csv("predict_res1.csv",index=None)
 
 # ------------------------------------------------------------
-
-# dataset_train = TensorDataset(data, labels)
-# train_loader = DataLoader(dataset_train, shuffle=False, batch_size=batch_size)
-
-# model = LSTM(input_dim=1, hidden_dim=2, output_dim=20)
-# model.to(device)
-# criterion = nn.MSELoss()
-
-# optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, betas=(0.9, 0.98), weight_decay=1e-5)
-# scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=15)
-
-# L_train = []
-# L_val = []
-
-# min_validation_loss = 9999
-# for epoch in range(num_epochs):
-#     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-#     train_running_loss = 0.0
-
-#     counter = 0
-#     model.train()
-#     for data_t, y in tqdm(train_loader):
-#         optimizer.zero_grad()
-#         counter += 1
-#         output = model(data_t.to(device))
-#         loss = criterion(output, y.to(device))
-#         train_running_loss += loss.item()
-#         loss.backward()
-#         optimizer.step()
-#     scheduler.step()
-#     TL = train_running_loss / counter
-#     L_train.append(TL)
-#     counter = 0
-#     print("Train loss: ", TL)
-
-
-# results = predict(predict_path,predict_input,model)
-
-# print(results)
-# df_pre = pd.read_csv('./data/predict_table.csv')
-
-# for k in results.keys():
-#     idx = df_pre.index[df_pre['product_pid'] == k].tolist()
-#     v = results[k]
-#     for i,id in enumerate(idx):
-#         df_pre.loc[id, 'apply_amt_pred'] = v[i][0]
-#         df_pre.loc[id, 'redeem_amt_pred'] = v[i][1]
-#         df_pre.loc[id, 'net_in_amt_pred'] = v[i][0] - v[i][1]
-        
-        
-# df_pre.to_csv("predict_res1.csv",index=None)
-# # 训练
-# for epoch in range(num_epochs):
-#     optimizer.zero_grad()
-#     output = model(X)
-#     loss = criterion(output.squeeze(), y)
-#     loss.backward()
-#     optimizer.step()
