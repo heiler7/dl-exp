@@ -1,5 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '5'
+os.environ['CUDA_VISIBLE_DEVICES'] = '3'
 
 import torch
 import torch.nn as nn
@@ -289,7 +289,7 @@ def predict(path,predict_input,model):
             # output = model(data.to(device))
             output = model(data.to(device))
             output = output.squeeze(0)
-            results[i] = np.array(output.cpu())
+            results[i] = np.array(output.cpu()).astype(np.float32)
 
     return results
     
@@ -314,13 +314,13 @@ def predict_trans(path,predict_input,model):
                 target1 = torch.cat([target1,output],dim=1)
             
             # test
-            target1 = target1[:,1:,:]
-            output1 = model(data.to(device),target1).squeeze(0)
-            results[i] = np.array(output1.cpu())
+            # target1 = target1[:,1:,:]
+            # output1 = model(data.to(device),target1).squeeze(0)
+            # results[i] = np.array(output1.cpu())
             
             # before
-            # target1 = target1[:,1:,:].squeeze(0)
-            # results[i] = np.array(target1.cpu())
+            target1 = target1[:,1:,:].squeeze(0)
+            results[i] = np.array(target1.cpu()).astype(np.float32)
 
     return results
 
@@ -359,7 +359,6 @@ for _, group in groups:
         continue
     
     predict_trans_input[product_name] = templst
-    
     
     for i in range(num_samples - 29):
         sample = product_samples[i:i + 30, :]
@@ -403,8 +402,6 @@ k = 5
 input_dim = 14
 output_dim = 2
 target_input_dim = 2
-seq_length = 20
-pred_length = 10
 
 Lk = []
 Lk_v = []
@@ -543,6 +540,6 @@ for key in results_all[0].keys():
         df_pre.loc[id, 'net_in_amt_pred'] = v[i][0] - v[i][1]
         
         
-df_pre.to_csv("predict_res1.csv",index=None)
+df_pre.to_csv("predict_res2.csv",index=None)
 
 # ------------------------------------------------------------
