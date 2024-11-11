@@ -21,10 +21,8 @@ from sklearn.model_selection import KFold
 from sentence_transformers import SentenceTransformer
 from datetime import datetime
 from sklearn.preprocessing import normalize
-from sklearn.preprocessing import MinMaxScaler
 
 # 定义LSTM模型
-
 class LSTM(nn.Module):
     def __init__(self, input_dim=1, hidden_dim=1, output_dim=1,batch_first=True):
         super(LSTM, self).__init__()
@@ -105,7 +103,7 @@ class TransformerTimeSeries(nn.Module):
         self.input_projection = nn.Linear(n_encoder_inputs, channels)
         self.output_projection = nn.Linear(n_decoder_inputs, channels)
 
-        self.fc = nn.Linear(channels, n_decoder_inputs)
+        self.fc = nn.Linear(channels, 2)
         self.do = nn.Dropout(p=self.dropout)
 
     def encode_src(self, src):
@@ -146,8 +144,7 @@ class TransformerTimeSeries(nn.Module):
         trg = pos_decoder + trg_start
         trg_mask = self.gen_trg_mask(out_sequence_len, trg.device)
 
-        out = self.decoder(tgt=trg, memory=memory, tgt_mask=trg_mask) 
-        out = out + trg_start
+        out = self.decoder(tgt=trg, memory=memory, tgt_mask=trg_mask) + trg_start
         out = out.permute(1, 0, 2)
         out = self.fc(out)
 
@@ -162,6 +159,89 @@ class TransformerTimeSeries(nn.Module):
         output = self.decode_trg(trg=target, memory=src)
         return output
 
+
+# Decomposition-Linear，DLinear模型
+class moving_avg(nn.Module):
+    def __init__(self, kernel_size, stride):
+        super(moving_avg, self).__init__()
+        self.kernel_size = kernel_size
+        self.avg = nn.AvgPool1d(kernel_size=kernel_size, stride=stride, padding=0)
+    
+    def forward(self, x):
+        front = x[:, 0:1, :].repeat(1, (self.kernel_size - 1) // 2, 1)
+        end = x[:, -1:, :].repeat(1, (self.kernel_size - 1) // 2, 1)
+        x = torch.cat([front, x, end], dim=1)
+        x = self.avg(x.permute(0, 2, 1))
+        x = x.permute(0, 2, 1)
+        return x
+ 
+class series_decomp(nn.Module):
+    def __init__(self, kernel_size):
+        super(series_decomp, self).__init__()
+        self.moving_avg = moving_avg(kernel_size, stride=1)
+ 
+    def forward(self, x):
+        moving_mean = self.moving_avg(x)
+        res = x - moving_mean
+        return res, moving_mean
+
+class DLModel(nn.Module):
+    def __init__(self, configs):
+        super(DLModel, self).__init__()
+        self.seq_len = configs['seq_len']
+        self.pred_len = configs['pred_len']
+        self.channels = configs['enc_in']
+        self.individual = configs['individual']
+        self.output_len = configs['output_len']
+        self.input_pos_embedding = torch.nn.Embedding(1024, embedding_dim=configs['seq_len'])
+        self.input_projection = nn.Linear(self.channels, 512)
+        
+        # Decompsition Kernel Size
+        kernel_size = 25
+        self.decompsition = series_decomp(kernel_size)
+        
+        self.fc1 = nn.Linear(512, self.output_len)
+        self.fc = nn.Linear(self.channels,self.output_len)
+        if self.individual:
+            self.Linear_Seasonal = nn.ModuleList()
+            self.Linear_Trend = nn.ModuleList()
+            
+            for i in range(self.channels):
+                self.Linear_Seasonal.append(nn.Linear(self.seq_len,self.pred_len))
+                self.Linear_Trend.append(nn.Linear(self.seq_len,self.pred_len))
+ 
+                # Use this two lines if you want to visualize the weights
+                # self.Linear_Seasonal[i].weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len,self.seq_len]))
+                # self.Linear_Trend[i].weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len,self.seq_len]))
+        else:
+            self.Linear_Seasonal = nn.Linear(self.seq_len,self.pred_len)
+            self.Linear_Trend = nn.Linear(self.seq_len,self.pred_len)
+            
+            # Use this two lines if you want to visualize the weights
+            # self.Linear_Seasonal.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len,self.seq_len]))
+            # self.Linear_Trend.weight = nn.Parameter((1/self.seq_len)*torch.ones([self.pred_len,self.seq_len]))
+ 
+    def forward(self, x):
+        # x: [Batch, Input length, Channel]
+        seasonal_init, trend_init = self.decompsition(x)
+        seasonal_init, trend_init = seasonal_init.permute(0,2,1), trend_init.permute(0,2,1)
+        if self.individual:
+            seasonal_output = torch.zeros([seasonal_init.size(0),seasonal_init.size(1),self.pred_len],dtype=seasonal_init.dtype).to(seasonal_init.device)
+            trend_output = torch.zeros([trend_init.size(0),trend_init.size(1),self.pred_len],dtype=trend_init.dtype).to(trend_init.device)
+            for i in range(self.channels):
+                seasonal_output[:,i,:] = self.Linear_Seasonal[i](seasonal_init[:,i,:])
+                trend_output[:,i,:] = self.Linear_Trend[i](trend_init[:,i,:])
+        else:
+            seasonal_output = self.Linear_Seasonal(seasonal_init)
+            trend_output = self.Linear_Trend(trend_init)
+ 
+        x = seasonal_output + trend_output
+        x = x.permute(0,2,1)
+        # x = self.fc(x)
+        x = x[:,:,2:5]
+        return x # to [Batch, Output length, output_seq_len]
+
+
 def predict(path,predict_input,model):
     results = {}
     df = pd.read_csv(path)
@@ -172,7 +252,7 @@ def predict(path,predict_input,model):
         for i in products:
             data = predict_input[i]
             data = np.array(data).astype(np.float32)
-            data = data[-20:,:]
+            data = data[-(threshold-10):,:]
             data = torch.tensor(data, dtype=torch.float32)
             data = data.reshape(1,data.shape[0],data.shape[1])
             # output = model(data.to(device))
@@ -194,7 +274,7 @@ def predict_trans(path,predict_input,model):
             data = np.array(data).astype(np.float32)
             data = torch.tensor(data, dtype=torch.float32)
             data = data.reshape(1,data.shape[0],data.shape[1])
-            target1 = torch.narrow(data, dim=-1, start=2, length=target_input_dim)[0,-1,:]
+            target1 = torch.narrow(data, dim=-1, start=2, length=2)[0,-1,:]
             target1 = target1.reshape(1,1,-1).to(device)
             # output = model(data.to(device))
             for j in range(10):
@@ -222,6 +302,7 @@ df = pd.read_csv(r'./data/product_info_simple_final_train_1.csv')
 predict_path = './data/predict_input.csv'
 
 groups = df.groupby('product_pid')
+threshold = 30
 samples = []
 
 predict_input = {}
@@ -229,7 +310,6 @@ predict_trans_input = {}
 for _, group in groups:
     product_samples = group.values
     num_samples = len(product_samples)
-    # scaler = MinMaxScaler(feature_range=(-1, 1))
     product_name = product_samples[0][0]
         
     templst = []
@@ -246,11 +326,11 @@ for _, group in groups:
     
     predict_trans_input[product_name] = templst
     
-    if num_samples < 30:
+    if num_samples < threshold:
         continue
     
-    for i in range(num_samples - 29):
-        sample = product_samples[i:i + 30, :]
+    for i in range(num_samples - threshold + 1):
+        sample = product_samples[i:i + threshold, :]
         column_redeem_temp = sample[-10:, 3]
         column_apply_temp = sample[-10:, 2]
         
@@ -259,15 +339,7 @@ for _, group in groups:
             samples.append(sample)
     
     predict_input[product_name] = samples[-1]
-    
-    # for i in range(num_samples):
-    #     sample = product_samples[i, :]
-        
-    #     column_redeem_temp = sample[3]
-    #     column_apply_temp = sample[2]
 
-    #     if np.count_nonzero(column_redeem_temp) == 1 and np.count_nonzero(column_apply_temp) == 1:
-    #         samples.append([sample])
 
 final_array = np.array(samples)
 # temp = np.concatenate((final_array[: , : , 5:7].astype(np.float32),final_array[: , : , 9:].astype(np.float32)),axis=2)
@@ -286,11 +358,13 @@ labels = torch.tensor(train_label, dtype=torch.float32)
 batch_size = 500
 learning_rate = 0.001
 N = data.shape[0]
-num_epochs = 51
+num_epochs = 50
 k = 5
 input_dim = 14
-output_dim = 3
-target_input_dim = 3
+output_dim = 2
+target_input_dim = 2
+
+DLconfigs = {'seq_len':threshold-10,'pred_len':10,'individual':False,'enc_in':3,'output_len':3}
 
 Lk = []
 Lk_v = []
@@ -299,148 +373,152 @@ results_all = []
 cl_splits = KFold(n_splits=k, shuffle=False)
 splits = cl_splits.split(np.arange(N))
 
-# for i, (train_idx, test_idx) in enumerate(splits):
-#     print('Fold {}'.format(i + 1))
-#     data_train = data[train_idx.tolist()]
-#     data_val = data[test_idx.tolist()]
-#     label_train = labels[train_idx.tolist()]
-#     label_val = labels[test_idx.tolist()]
+for i, (train_idx, test_idx) in enumerate(splits):
+    print('Fold {}'.format(i + 1))
+    data_train = data[train_idx.tolist()]
+    data_val = data[test_idx.tolist()]
+    label_train = labels[train_idx.tolist()]
+    label_val = labels[test_idx.tolist()]
 
-#     print(data_val.shape, data_train.shape)
+    print(data_val.shape, data_train.shape)
 
-#     dataset_train = TensorDataset(data_train, label_train)
-#     dataset_val = TensorDataset(data_val, label_val)
-#     train_loader = DataLoader(dataset_train, shuffle=False, batch_size=batch_size)
-#     val_loader = DataLoader(dataset_val, shuffle=False, batch_size=batch_size)
+    dataset_train = TensorDataset(data_train, label_train)
+    dataset_val = TensorDataset(data_val, label_val)
+    train_loader = DataLoader(dataset_train, shuffle=False, batch_size=batch_size)
+    val_loader = DataLoader(dataset_val, shuffle=False, batch_size=batch_size)
     
-#     model = TransformerTimeSeries(input_dim, target_input_dim)
+    model = DLModel(configs=DLconfigs)
     
-#     # model = LSTM(input_dim=1, hidden_dim=2, output_dim=20)
-#     model.to(device)
-#     criterion = nn.MSELoss()
-
-#     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, betas=(0.9, 0.98), weight_decay=1e-5)
-#     scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=15)
+    # model = TransformerTimeSeries(input_dim, target_input_dim)
     
-    
-#     L_train = []
-#     L_val = []
+    # model = LSTM(input_dim=1, hidden_dim=2, output_dim=20)
+    model.to(device)
+    criterion = nn.MSELoss()
 
-#     min_validation_loss = 9999
-#     for epoch in range(num_epochs):
-#         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-#         train_running_loss = 0.0
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, betas=(0.9, 0.98), weight_decay=1e-5)
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=15)
 
-#         counter = 0
-#         model.train()
-#         for data_t, y in tqdm(train_loader):
-#             optimizer.zero_grad()
-#             counter += 1
-#             # output = model(data_t.to(device))
+    L_train = []
+    L_val = []
+
+    min_validation_loss = 9999
+    for epoch in range(num_epochs):
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        train_running_loss = 0.0
+
+        counter = 0
+        model.train()
+        for data_t, y in tqdm(train_loader):
+            optimizer.zero_grad()
+            counter += 1
+            output = model(data_t.to(device))
             
-#             # Transformers:
-#             target = torch.cat([data_t[:,-1:,2:5],y],dim=1).to(device)
-#             output = model(data_t.to(device),target)
-#             output = output[:,:-1,:]
+            # Transformers:
+            # target = torch.cat([data_t[:,-1:,2:4],y],dim=1).to(device)
+            # output = model(data_t.to(device),target)
+            # output = output[:,:-1,:]
             
-#             loss = criterion(output, y.to(device))
-#             train_running_loss += loss.item()
-#             loss.backward()
-#             optimizer.step()
-#         scheduler.step()
-#         TL = train_running_loss / counter
-#         L_train.append(TL)
-#         model.eval()
-#         predict_res = []
-#         labels_true = []
+            loss = criterion(output, y.to(device))
+            train_running_loss += loss.item()
+            loss.backward()
+            optimizer.step()
+        scheduler.step()
+        TL = train_running_loss / counter
+        L_train.append(TL)
+        model.eval()
+        predict_res = []
+        labels_true = []
 
-#         counter = 0
-#         with torch.no_grad():
-#             current_test_loss = 0.0
+        counter = 0
+        with torch.no_grad():
+            current_test_loss = 0.0
 
-#             for data_v, y in tqdm(val_loader):
-#                 counter += 1
-#                 # output = model(data_v.to(device),y.to(device))
+            for data_v, y in tqdm(val_loader):
+                counter += 1
+                output = model(data_v.to(device))
                 
-#                 # Transformers:
-#                 target = torch.cat([data_v[:,-1:,2:5],y],dim=1).to(device)
-#                 output = model(data_v.to(device),target)
-#                 output = output[:,:-1,:]
+                # Transformers:
+                # target = torch.cat([data_v[:,-1:,2:4],y],dim=1).to(device)
+                # output = model(data_v.to(device),target)
+                # output = output[:,:-1,:]
                 
-#                 loss = criterion(output, y.to(device))
-#                 current_test_loss += loss.item()
-#                 predict_res.extend(output.cpu().numpy())
-#                 labels_true.extend(y.cpu().numpy())
-#             T_loss = current_test_loss / counter
-#             L_val.append(T_loss)
-#             if min_validation_loss > T_loss:
-#                 min_validation_loss = T_loss
-#                 best_epoch = epoch
-#                 print('Min validation_loss ' + str(min_validation_loss) + ' in epoch ' + str(best_epoch))
-#                 torch.save(model.state_dict(), fr"weight/model_1_{i}.pt")
-#         predict_res = np.array(predict_res)
-#         labels_true = np.array(labels_true)
-#         flattened_array1 = predict_res.flatten()
-#         flattened_array2 = labels_true.flatten()
-#         correlation_matrix = np.corrcoef(flattened_array1, flattened_array2)
-#         correlation_value = correlation_matrix[0, 1]
+                loss = criterion(output, y.to(device))
+                current_test_loss += loss.item()
+                predict_res.extend(output.cpu().numpy())
+                labels_true.extend(y.cpu().numpy())
+            T_loss = current_test_loss / counter
+            L_val.append(T_loss)
+            if min_validation_loss > T_loss:
+                min_validation_loss = T_loss
+                best_epoch = epoch
+                print('Min validation_loss ' + str(min_validation_loss) + ' in epoch ' + str(best_epoch))
+                torch.save(model.state_dict(), fr"weight/model_1_{i}.pt")
+                
+        predict_res = np.array(predict_res)
+        labels_true = np.array(labels_true)
+        flattened_array1 = predict_res.flatten()
+        flattened_array2 = labels_true.flatten()
+        correlation_matrix = np.corrcoef(flattened_array1, flattened_array2)
+        correlation_value = correlation_matrix[0, 1]
 
-#         print("Train loss: ", TL, "Val loss: ", T_loss,'correlation_value',correlation_value)
+        print("Train loss: ", TL, "Val loss: ", T_loss,'correlation_value',correlation_value)
         
-#     Lk.append(L_train)
-#     Lk_v.append(L_val)
+    Lk.append(L_train)
+    Lk_v.append(L_val)
     
-#     # results1 = predict(predict_path,predict_input,model)
-#     # transformer:
-#     results1 = predict_trans(predict_path,predict_input,model)
-#     # results1 = predict_trans(predict_path,predict_trans_input,model)
-#     results_all.append(results1)
+    # results1 = predict(predict_path,predict_input,model)
+    results1 = predict(predict_path,predict_trans_input,model)
+    
+    # transformer:
+    # results1 = predict_trans(predict_path,predict_input,model)
+    # results1 = predict_trans(predict_path,predict_trans_input,model)
+    
+    results_all.append(results1)
 
-# fig1, ax1 = plt.subplots()
-# for i, fold_train_loss in enumerate(Lk):
-#     ax1.plot(fold_train_loss, label=f"Fold {i + 1}")
-# ax1.legend(loc='upper right')
-# ax1.set_xlabel('Epoch')
-# ax1.set_ylabel('Training Loss')
-# ax1.set_title('5-fold cross-validation training losses')
+fig1, ax1 = plt.subplots()
+for i, fold_train_loss in enumerate(Lk):
+    ax1.plot(fold_train_loss, label=f"Fold {i + 1}")
+ax1.legend(loc='upper right')
+ax1.set_xlabel('Epoch')
+ax1.set_ylabel('Training Loss')
+ax1.set_title('5-fold cross-validation training losses')
 
-# fig2, ax2 = plt.subplots()
-# for i, fold_val_loss in enumerate(Lk_v):
-#     ax2.plot(fold_val_loss, label=f"Fold {i + 1}")
-# ax2.legend(loc='upper right')
-# ax2.set_xlabel('Epoch')
-# ax2.set_ylabel('Validation Loss')
-# ax2.set_title('5-fold cross-validation validation losses')
+fig2, ax2 = plt.subplots()
+for i, fold_val_loss in enumerate(Lk_v):
+    ax2.plot(fold_val_loss, label=f"Fold {i + 1}")
+ax2.legend(loc='upper right')
+ax2.set_xlabel('Epoch')
+ax2.set_ylabel('Validation Loss')
+ax2.set_title('5-fold cross-validation validation losses')
 
-# fig1.savefig("./images/image1_nop.png")
-# fig2.savefig("./images/image2_nop.png")
+fig1.savefig("./images/image1_nop.png")
+fig2.savefig("./images/image2_nop.png")
 
-# df_pre = pd.read_csv('./data/predict_table.csv')
-# for key in results_all[0].keys():
-#     idx = df_pre.index[df_pre['product_pid'] == key].tolist()
-#     v = results_all[0][key]
-#     for i,results in enumerate(results_all):
-#         if(i!=0):
-#             v += results[key]
-#     v /= 5
-#     for i,id in enumerate(idx):
-#         # df_pre.loc[id, 'apply_amt_pred'] = v[i][0]
-#         # df_pre.loc[id, 'redeem_amt_pred'] = v[i][1]
-#         # df_pre.loc[id, 'net_in_amt_pred'] = v[i][0] - v[i][1]
-#         df_pre.loc[id, 'apply_amt_pred'] = v[i][0]*0.5 + (v[i][1] + v[i][2])*0.5
-#         df_pre.loc[id, 'redeem_amt_pred'] = v[i][1]*0.5 + (v[i][0] - v[i][2])*0.5
-#         df_pre.loc[id, 'net_in_amt_pred'] = (v[i][0] - v[i][1]) * 0.5 + v[i][2]*0.5
+df_pre = pd.read_csv('./data/predict_table.csv')
+for key in results_all[0].keys():
+    idx = df_pre.index[df_pre['product_pid'] == key].tolist()
+    v = results_all[0][key]
+    for i,results in enumerate(results_all):
+        if(i!=0):
+            v += results[key]
+    v /= k
+    for i,id in enumerate(idx):
+        # df_pre.loc[id, 'apply_amt_pred'] = v[i][0]
+        # df_pre.loc[id, 'redeem_amt_pred'] = v[i][1]
+        df_pre.loc[id, 'apply_amt_pred'] = v[i][0]*0.5 + (v[i][1] + v[i][2])*0.5
+        df_pre.loc[id, 'redeem_amt_pred'] = v[i][1]*0.5 + (v[i][0] - v[i][2])*0.5
+        df_pre.loc[id, 'net_in_amt_pred'] = (v[i][0] - v[i][1]) * 0.5 + v[i][2]*0.5
         
         
-# df_pre.to_csv("predict_res4.csv",index=None)
+df_pre.to_csv("predict_res7.csv",index=None)
 
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------
 
 # 不作验证
 dataset_train = TensorDataset(data, labels)
 train_loader = DataLoader(dataset_train, shuffle=False, batch_size=batch_size)
 
-model = TransformerTimeSeries(input_dim, target_input_dim)
+model = DLModel(configs=DLconfigs)
 
 # model = TransformerTimeSeries(input_dim, target_input_dim)
 
@@ -465,12 +543,12 @@ for epoch in range(num_epochs):
         optimizer.zero_grad()
         counter += 1
         # dlinear and lstm
-        # output = model(data_t.to(device))
+        output = model(data_t.to(device))
         
         # Transformers:
-        target = torch.cat([data_t[:,-1:,2:5],y],dim=1).to(device)
-        output = model(data_t.to(device),target)
-        output = output[:,:-1,:]
+        # target = torch.cat([data_t[:,-1:,2:4],y],dim=1).to(device)
+        # output = model(data_t.to(device),target)
+        # output = output[:,:-1,:]
         
         loss = criterion(output, y.to(device))
         train_running_loss += loss.item()
@@ -480,7 +558,7 @@ for epoch in range(num_epochs):
     TL = train_running_loss / counter
     L_train.append(TL)
     
-results2 = predict_trans(predict_path,predict_trans_input,model)
+results2 = predict(predict_path,predict_trans_input,model)
 
 fig3, ax3 = plt.subplots()
 for i, fold_train_loss in enumerate(Lk):
@@ -488,7 +566,7 @@ for i, fold_train_loss in enumerate(Lk):
 ax3.legend(loc='upper right')
 ax3.set_xlabel('Epoch')
 ax3.set_ylabel('Training Loss')
-ax3.set_title('training losses')
+ax3.set_title('5-fold cross-validation training losses')
 
 fig4, ax4 = plt.subplots()
 for i, fold_val_loss in enumerate(Lk_v):
@@ -496,7 +574,7 @@ for i, fold_val_loss in enumerate(Lk_v):
 ax4.legend(loc='upper right')
 ax4.set_xlabel('Epoch')
 ax4.set_ylabel('Validation Loss')
-ax4.set_title('validation losses')
+ax4.set_title('5-fold cross-validation validation losses')
 
 fig3.savefig("./images/image3_nop.png")
 fig4.savefig("./images/image4_nop.png")
@@ -514,4 +592,4 @@ for key in results2.keys():
         df_pre.loc[id, 'net_in_amt_pred'] = (v[i][0] - v[i][1]) * 0.5 + v[i][2]*0.5
         
         
-df_pre.to_csv("predict_res3.csv",index=None)
+df_pre.to_csv("predict_res8.csv",index=None)
